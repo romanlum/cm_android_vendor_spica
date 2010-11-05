@@ -42,15 +42,17 @@
     LOGD("gps status callback: 0x%x", _s); \
   }
 
-//////////////////////////////////
+//**************************** RILD ****************************
 static void IntToByte(int64_t input,char output[8]);
 void open_rild();
 void close_rild();
 pthread_t ril_thread;
 static void *rild_thread_proc(void * arg);
-
 int rild_stop=0;
-///////////////////////////////////
+
+//**************************** XTRA ****************************
+GpsXtraCallbacks * spica_xtra_callbacks;
+//**************************************************************
 
 /* Nmea Parser stuff */
 
@@ -143,10 +145,6 @@ typedef struct {
 static GpsState  _gps_state[1];
 
 static GpsState *gps_state = _gps_state;
-
-
-
-
 
 static void *gps_timer_thread( void*  arg );
 
@@ -2357,7 +2355,7 @@ spica_gps_start()
     GpsState*  s = _gps_state;
     char buffer[1024];
     int len=24;
-		char initcmd[]={0x00, 0x00, 0x00, 0xc4, 0x3b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xb5, 0x00, 0x00, 
+    char initcmd[]=				 {0x00, 0x00, 0x00, 0xc4, 0x3b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xb5, 0x00, 0x00, 
                                   0x00, 0x0e, 0x04, 0xb5, 0x17, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -2373,7 +2371,7 @@ spica_gps_start()
                                   0x00};
                                  
    
-   char initcmd1[]={0x00,0x00,0x00,0x10,0x3b,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x03,0x00,0x00,
+        char initcmd1[]={0x00,0x00,0x00,0x10,0x3b,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x03,0x00,0x00,
                                0x00,0x0e,0x03,0x03,0x00};                              
                                   
    
@@ -2474,11 +2472,103 @@ static int spica_gps_set_position_mode(GpsPositionMode mode, int fix_frequency)
     return 0;
 }
 
+
+
+
+
+//*************************XTRA INTERFACE***********************************
+
+int  spica_gps_xtra_init( GpsXtraCallbacks* callbacks )
+{
+	spica_xtra_callbacks=callbacks;
+	return 0;
+}
+
+int  spica_gps_xtra_data( char* data, int length )
+{
+	int xtra_fd;
+	int parts,len,i,lastlen;
+	int start=0;
+	char set_xtra_data_request[]={ 0x00,0x00,0x00,0x10,0x3b,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x0e,0x22,0x04,0x01};
+	char header[]={0x00,0x04,0x01,0x27,0x01};
+	struct timespec test;	/*nanosleep brauch das timespec Structure*/
+
+	test.tv_sec  = 0;		
+	test.tv_nsec = 50000000;
+
+
+	LOGD("GPS_XTRA_DATA_REQUEST len=%d",length);
+	len=send(rildSocket,set_xtra_data_request,14,0);
+	LOGD("sent gps_inject_xtra %d\n",len);
+	sleep(1);
+	
+        LOGD("Injecting XTRA Data");
+	parts=(length)/1024;
+	LOGD("Injecting %d parts",parts);
+
+        xtra_fd=open("/dev/ttyXTRA0",O_WRONLY|O_LARGEFILE);
+	if(xtra_fd<0)
+	{
+		LOGE("error opening /dev/ttyXTRA0");
+		return -1;
+	}
+
+	for(i=0;i<parts;i++)
+	{	
+		header[2]=i+1;
+		LOGD("injecting part %d DATA[1]: 0x%x DATA[2]: 0x%x DATA[3]: 0x%x DATA[4]: 0x%x,DATA[4]: 0x%x",i+1,header[0],header[1],header[2],header[3],header[4]);
+
+		len=write(xtra_fd,header,5);
+		LOGD("written %d bytes",len);
+		len=write(xtra_fd,data+start,1024);
+		LOGD("written %d bytes",len);
+		start+=1024;
+		nanosleep(&test,NULL);
+	}
+        
+	lastlen=(length)%1024;
+	
+	if(lastlen>0)
+	{
+		LOGD("injecting last part, length=%x",lastlen);
+		header[2]=parts+1;
+		header[0]=(lastlen) & 0xFF;
+		header[1]=((lastlen) >> 8) & 0xFF;
+		write(xtra_fd,header,5);
+		len=write(xtra_fd,data+start,lastlen);
+		LOGD("written %d bytes",len);
+		nanosleep(&test,NULL);
+		
+		
+	}
+
+	close(xtra_fd);
+        
+	return 0;
+
+}
+
+//******************EXTRA INTERFACE ********************
+static const GpsXtraInterface spicaGpsXtraInterface = {
+	  spica_gps_xtra_init,
+	  spica_gps_xtra_data,
+};
+//*******************************************************
+
 static const void*
 spica_gps_get_extension(const char* name)
 {
+        LOGD("GET EXTENSION : %s",name);
+
+	if(strcmp(GPS_XTRA_INTERFACE,name)==0)
+	{
+		LOGD("returning XTRA interface");
+		return &spicaGpsXtraInterface;
+	}
+
     return NULL;
 }
+
 
 static const GpsInterface  spicaGpsInterface = {
     spica_gps_init,
@@ -2492,6 +2582,7 @@ static const GpsInterface  spicaGpsInterface = {
     spica_gps_get_extension,
 };
 
+
 const GpsInterface* gps_get_hardware_interface()
 {
 
@@ -2499,6 +2590,13 @@ const GpsInterface* gps_get_hardware_interface()
    return &spicaGpsInterface;
 }
 
+
+
+
+
+
+
+//***********************************************************************RILD*****************************************************
 void open_rild()
 {
 	 struct sockaddr_in server;
@@ -2536,10 +2634,10 @@ void close_rild()
 
 static void *rild_thread_proc(void * arg)
 {
-	int sock=*((int*)arg);
-	fd_set fds;
+  int sock=*((int*)arg);
+  fd_set fds;
   struct timeval timeout;
-  int rc;
+  int rc,type;
   char buffer[1024];
   int messageLength,len,remeaning;
 
@@ -2585,7 +2683,7 @@ static void *rild_thread_proc(void * arg)
                 | ((buffer[2] & 0xff) << 8)
                 | (buffer[3] & 0xff);
            
-          bufpoint=buffer;
+            bufpoint=buffer;
       		remeaning=messageLength;
       		while(remeaning > 0)
       		{ 
@@ -2599,6 +2697,21 @@ static void *rild_thread_proc(void * arg)
       			bufpoint+=len;
       			
       		}
+
+			type=((buffer[0] & 0xff) )| ((buffer[1] & 0xff) << 8)| ((buffer[2] & 0xff) << 16)| ((buffer[3] & 0xff)<<24);
+			//TYPE 1 UNSOL_RESPONSE
+			if(type==1)
+			{
+				int cmd=((buffer[4] & 0xff) )| ((buffer[5] & 0xff) << 8)| ((buffer[6]& 0xff) << 16)| ((buffer[7] & 0xff)<<24);
+				//INJECT_XTRA_REQUEST
+				if(cmd == 11006)
+				{
+					LOGD("UNSOL_DOWNLOAD_REQUEST");
+					spica_xtra_callbacks->download_request_cb();
+				}
+			}
+
+
 					
 					      		
       	}      
@@ -2611,6 +2724,8 @@ static void *rild_thread_proc(void * arg)
 	 return 0;
 
 }
+
+
 
 
 
